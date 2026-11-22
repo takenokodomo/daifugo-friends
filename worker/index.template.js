@@ -343,9 +343,38 @@ async function route(request, env) {
   }
 }
 
+const ALLOWED_WEB_ORIGINS = new Set([
+  "https://takenokodomo.github.io",
+  "https://daifugo-friends-2026.adoreddisc16.chatgpt.site",
+]);
+
+function corsHeaders(origin) {
+  const headers = new Headers();
+  if (ALLOWED_WEB_ORIGINS.has(origin)) {
+    headers.set("access-control-allow-origin", origin);
+    headers.set("access-control-allow-methods", "GET, POST, OPTIONS");
+    headers.set("access-control-allow-headers", "content-type");
+    headers.set("access-control-max-age", "86400");
+    headers.set("vary", "Origin");
+  }
+  return headers;
+}
+
+function withCors(response, origin) {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of corsHeaders(origin)) headers.set(key, value);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 export default {
   async fetch(request, env) {
-    try { return await route(request, env); }
-    catch { return json({ error: "サーバーでエラーが発生しました。" }, 500); }
+    const origin = request.headers.get("origin") || "";
+    if (request.method === "OPTIONS") {
+      return ALLOWED_WEB_ORIGINS.has(origin)
+        ? new Response(null, { status: 204, headers: corsHeaders(origin) })
+        : new Response(null, { status: 403 });
+    }
+    try { return withCors(await route(request, env), origin); }
+    catch { return withCors(json({ error: "サーバーでエラーが発生しました。" }, 500), origin); }
   },
 };
