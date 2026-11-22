@@ -36,7 +36,7 @@ function nextActive(state, from, includeFrom = false) {
   for (let step = includeFrom ? 0 : 1; step <= state.players.length; step++) {
     const index = (from + step + state.players.length) % state.players.length;
     const player = state.players[index];
-    if ((state.hands[player.id] || []).length > 0) return index;
+    if ((state.hands[player.id] || []).length > 0 && (!state.table || !(state.passedPlayers || []).includes(player.id))) return index;
   }
   return from;
 }
@@ -45,7 +45,7 @@ function newState(host, name) {
   return {
     phase: "lobby", hostId: host, players: [{ id: host, name }], hands: {},
     turn: 0, table: null, passes: 0, lastPlayer: null, revolution: false, back: false,
-    pendingEightCut: null, rules: { ...DEFAULT_RULES },
+    pendingEightCut: null, passedPlayers: [], events: [], rules: { ...DEFAULT_RULES },
     finishOrder: [], createdAt: Date.now(),
   };
 }
@@ -59,6 +59,7 @@ function publicState(state, viewerId) {
       name: player.name, cards: (state.hands[player.id] || []).length,
       isHost: player.id === state.hostId, isYou: player.id === viewerId,
       isTurn: current?.id === player.id,
+      hasPassed: (state.passedPlayers || []).includes(player.id),
       place: state.finishOrder.indexOf(player.id) + 1 || null,
     })),
     hand: state.hands[viewerId] || [],
@@ -68,6 +69,15 @@ function publicState(state, viewerId) {
     revolution: state.revolution,
     back: state.back,
     pendingEightCut: state.pendingEightCut ? { fourCount: state.pendingEightCut.fourCount } : null,
+    events: (state.events || []).slice(-8).map((event) => ({
+      id: event.id,
+      type: event.type,
+      playerName: event.playerName || state.players.find((player) => player.id === event.playerId)?.name || "?",
+      relatedPlayerName: event.relatedPlayerName || (event.relatedPlayerId ? (state.players.find((player) => player.id === event.relatedPlayerId)?.name || "?") : null),
+      isYou: event.playerId === viewerId,
+      cards: event.cards || [],
+      at: event.at,
+    })),
     rules: state.rules,
     finishOrder: state.finishOrder.map((id) => ({ name: state.players.find((p) => p.id === id)?.name || "?", isYou: id === viewerId })),
     createdAt: state.createdAt,
@@ -132,6 +142,62 @@ async function joinRoom(db, body) {
   return json({ error: "参加が重なりました。もう一度お試しください。" }, 409);
 }
 
+async function leaveRoom(db, body) {
+  const code = String(body.code || "").trim().toUpperCase();
+  const id = String(body.playerId || "");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await getRoom(db, code);
+    if (!row) return json({ ok: true, removed: false });
+    const state = JSON.parse(row.state);
+    const index = state.players.findIndex((player) => player.id === id);
+    if (index < 0) return json({ ok: true, removed: false });
+    const leavingName = state.players[index].name;
+    const currentPlayerId = state.players[state.turn]?.id;
+    const wasLeader = state.lastPlayer === id || state.pendingEightCut?.playerId === id;
+    recordEvent(state, "leave", id);
+    state.players.splice(index, 1);
+    delete state.hands[id];
+    state.finishOrder = (state.finishOrder || []).filter((playerId) => playerId !== id);
+    state.passedPlayers = (state.passedPlayers || []).filter((playerId) => playerId !== id);
+    state.passes = state.passedPlayers.length;
+    if (state.hostId === id) state.hostId = state.players[0]?.id || null;
+    if (!state.players.length) {
+      await db.prepare("DELETE FROM rooms WHERE code = ?").bind(code).run();
+      return json({ ok: true, removed: true });
+    }
+    if (state.phase === "playing") {
+      const activePlayers = state.players.filter((player) => (state.hands[player.id] || []).length > 0);
+      if (activePlayers.length <= 1) {
+        finishEmptyHands(state, activePlayers[0]?.id || state.players[0].id);
+      } else if (state.table && !wasLeader && state.passes >= activePlayers.length - 1) {
+        const leaderId = state.lastPlayer;
+        const playedCards = state.table.cards;
+        clearTrick(state, leaderId);
+        recordEvent(state, "trick_cleared", leaderId, playedCards);
+      } else if (wasLeader) {
+        state.table = null;
+        state.pendingEightCut = null;
+        state.lastPlayer = null;
+        state.passes = 0;
+        state.passedPlayers = [];
+        const nextIndex = Math.min(index, state.players.length - 1);
+        state.turn = nextActive(state, nextIndex - 1, false);
+      } else if (currentPlayerId === id) {
+        state.turn = nextActive(state, index - 1, false);
+      } else {
+        const currentIndex = state.players.findIndex((player) => player.id === currentPlayerId);
+        state.turn = currentIndex >= 0 ? currentIndex : nextActive(state, index - 1, false);
+      }
+    } else if (currentPlayerId && currentPlayerId !== id) {
+      state.turn = Math.max(0, state.players.findIndex((player) => player.id === currentPlayerId));
+    } else {
+      state.turn = 0;
+    }
+    if (await saveRoom(db, code, row, state)) return json({ ok: true, removed: true, playerName: leavingName });
+  }
+  return json({ error: "退出処理が重なりました。もう一度お試しください。" }, 409);
+}
+
 async function updateRules(db, body) {
   const code = String(body.code || "").trim().toUpperCase();
   const id = String(body.playerId || "");
@@ -165,6 +231,7 @@ async function startGame(db, body) {
     deck.forEach((item, index) => hands[state.players[index % state.players.length].id].push(item));
     Object.values(hands).forEach((hand) => hand.sort(cardOrder));
     state.hands = hands;
+    state.passedPlayers = [];
     state.turn = state.players.findIndex((p) => hands[p.id].some((item) => item.id === "3-clubs"));
     state.phase = "playing";
     if (await saveRoom(db, code, row, state)) return json({ ok: true });
@@ -200,9 +267,18 @@ function clearTrick(state, leaderId) {
   state.table = null;
   state.pendingEightCut = null;
   state.passes = 0;
+  state.passedPlayers = [];
   state.back = false;
   const leaderIndex = state.players.findIndex((p) => p.id === leaderId);
   state.turn = nextActive(state, leaderIndex < 0 ? state.turn : leaderIndex, true);
+}
+
+function recordEvent(state, type, playerId, cards = [], relatedPlayerId = null) {
+  const playerName = state.players.find((player) => player.id === playerId)?.name || "?";
+  const relatedPlayerName = relatedPlayerId ? (state.players.find((player) => player.id === relatedPlayerId)?.name || "?") : null;
+  state.events = [...(state.events || []), {
+    id: crypto.randomUUID(), type, playerId, playerName, relatedPlayerId, relatedPlayerName, cards, at: Date.now(),
+  }].slice(-8);
 }
 
 function finishEmptyHands(state, firstPlayerId) {
@@ -236,6 +312,7 @@ async function act(db, body) {
       const fours = hand.filter((item) => item.rank === "4" || item.rank === "JOKER");
       if (fours.length < requiredFours) return json({ error: `4を${requiredFours}枚持っていないため、4止めできません。` }, 400);
       const picked = fours.slice(0, requiredFours);
+      const eightPlayerId = state.pendingEightCut.playerId;
       state.hands[id] = hand.filter((item) => !picked.some((four) => four.id === item.id));
       state.lastPlayer = id;
       state.table = null;
@@ -244,12 +321,15 @@ async function act(db, body) {
       state.back = false;
       finishEmptyHands(state, id);
       if (state.phase !== "finished") state.turn = state.players.findIndex((p) => p.id === id);
+      recordEvent(state, "eight_stopped", id, picked, eightPlayerId);
       if (await saveRoom(db, code, row, state)) return json({ ok: true });
       continue;
     }
     if (state.pendingEightCut && action === "pass") {
       const leaderId = state.pendingEightCut.playerId;
+      const playedCards = state.table?.cards || [];
       clearTrick(state, leaderId);
+      recordEvent(state, "eight_accepted", id, playedCards, leaderId);
       if (await saveRoom(db, code, row, state)) return json({ ok: true });
       continue;
     }
@@ -279,6 +359,7 @@ async function act(db, body) {
       state.table = { cards: picked, playerId: id };
       state.lastPlayer = id;
       state.passes = 0;
+      state.passedPlayers = [];
       if (rules.revolution && picked.length === 4) state.revolution = !state.revolution;
       if (rules.elevenBack && playRank === "J") state.back = !state.back;
       if (rules.qBomber && bombRanks.length) {
@@ -292,18 +373,28 @@ async function act(db, body) {
       if (state.phase !== "finished" && rules.fourStop && has8) {
         state.pendingEightCut = { playerId: id, fourCount: picked.length * 2 };
         state.turn = nextActive(state, state.players.findIndex((p) => p.id === id));
+        recordEvent(state, "eight_pending", id, picked);
       } else if (state.phase !== "finished" && (has8 || has9 || has66 || has99 || spade3Return)) {
         clearTrick(state, id);
+        recordEvent(state, has8 ? "eight_cut" : "special_clear", id, picked);
       } else if (state.phase !== "finished") {
+        recordEvent(state, "play", id, picked);
         state.turn = nextActive(state, state.turn);
+      } else {
+        recordEvent(state, has8 ? "eight_cut" : "play", id, picked);
       }
     } else if (action === "pass") {
       if (!state.table) return json({ error: "場が流れています。最初のカードを出してください。" }, 400);
-      state.passes++;
+      state.passedPlayers = [...new Set([...(state.passedPlayers || []), id])];
+      state.passes = state.passedPlayers.length;
       const activeCount = state.players.filter((p) => (state.hands[p.id] || []).length > 0).length;
       if (state.passes >= activeCount - 1) {
-        clearTrick(state, state.lastPlayer);
+        const leaderId = state.lastPlayer;
+        const playedCards = state.table.cards;
+        clearTrick(state, leaderId);
+        recordEvent(state, "trick_cleared", leaderId, playedCards);
       } else {
+        recordEvent(state, "pass", id);
         state.turn = nextActive(state, state.turn);
       }
     } else {
@@ -325,6 +416,7 @@ async function route(request, env) {
     await ensureSchema(env.DB);
     if (request.method === "POST" && url.pathname === "/api/rooms") return await createRoom(env.DB, await request.json());
     if (request.method === "POST" && url.pathname === "/api/join") return await joinRoom(env.DB, await request.json());
+    if (request.method === "POST" && url.pathname === "/api/leave") return await leaveRoom(env.DB, await request.json());
     if (request.method === "POST" && url.pathname === "/api/rules") return await updateRules(env.DB, await request.json());
     if (request.method === "POST" && url.pathname === "/api/start") return await startGame(env.DB, await request.json());
     if (request.method === "POST" && url.pathname === "/api/action") return await act(env.DB, await request.json());
