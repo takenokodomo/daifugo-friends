@@ -23,14 +23,15 @@
 <div id="toast" class="toast hidden" role="status"></div>
 <script>
 const $=(s)=>document.querySelector(s);const nameInput=$("#name"),roomInput=$("#roomCode"),homeError=$("#homeError"),home=$("#home"),game=$("#game"),rulesModal=$("#rulesModal"),toast=$("#toast");
+const API_BASE="https://daifugo-friends-2026.adoreddisc16.chatgpt.site",appBase=new URL(".",location.href).pathname;
 let playerId=localStorage.getItem("daifugoPlayerId")||crypto.randomUUID(),roomCode="",roomState=null,selected=new Set(),poller=null,toastTimer=null;
 localStorage.setItem("daifugoPlayerId",playerId);nameInput.value=localStorage.getItem("daifugoName")||"";
 const symbol={clubs:"♣",diamonds:"♦",hearts:"♥",spades:"♠"};
 function message(text){toast.textContent=text;toast.classList.remove("hidden");clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.classList.add("hidden"),2400)}
-async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",headers:body?{"content-type":"application/json"}:{},body:body?JSON.stringify(body):undefined,cache:"no-store"});const data=await r.json();if(!r.ok)throw new Error(data.error||"通信に失敗しました。");return data}
+async function api(path,body){const r=await fetch(API_BASE+path,{method:body?"POST":"GET",headers:body?{"content-type":"application/json"}:{},body:body?JSON.stringify(body):undefined,cache:"no-store"});const data=await r.json();if(!r.ok)throw new Error(data.error||"通信に失敗しました。");return data}
 function saveName(){const n=nameInput.value.trim().slice(0,16);localStorage.setItem("daifugoName",n);return n}
 function fail(err,target=homeError){target.textContent=err.message||String(err)}
-function enterRoom(code,id){roomCode=code;playerId=id;localStorage.setItem("daifugoPlayerId",id);history.replaceState(null,"",`/?room=${encodeURIComponent(code)}`);home.classList.add("hidden");game.classList.remove("hidden");homeError.textContent="";selected.clear();refresh();clearInterval(poller);poller=setInterval(refresh,1500)}
+function enterRoom(code,id){roomCode=code;playerId=id;localStorage.setItem("daifugoPlayerId",id);history.replaceState(null,"",`${appBase}?room=${encodeURIComponent(code)}`);home.classList.add("hidden");game.classList.remove("hidden");homeError.textContent="";selected.clear();refresh();clearInterval(poller);poller=setInterval(refresh,1500)}
 $("#createBtn").addEventListener("click",async()=>{homeError.textContent="";try{const res=await api("/api/rooms",{name:saveName()});enterRoom(res.code,res.playerId)}catch(e){fail(e)}});
 $("#joinBtn").addEventListener("click",async()=>{homeError.textContent="";try{const res=await api("/api/join",{code:roomInput.value,playerId,name:saveName()});enterRoom(res.code,res.playerId)}catch(e){fail(e)}});
 roomInput.addEventListener("input",()=>roomInput.value=roomInput.value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g,"").slice(0,5));
@@ -40,7 +41,7 @@ async function refresh(){if(!roomCode)return;try{roomState=await api(`/api/room?
 function render(){const s=roomState;if(!s)return;if(s.phase==="lobby"){renderLobby(s);return}if(s.phase==="finished"){renderFinish(s);return}renderGame(s)}
 function roomHeader(){return `<div class="gameTop"><div class="roomBadge"><div><div class="subtle">ROOM CODE</div><div class="code">${roomCode}</div></div><div class="subtle">友達にコードを共有しよう</div></div><button class="share" id="shareBtn">招待リンクをコピー</button></div>`}
 function roster(s){return `<div class="roster">${s.players.map(p=>`<div class="rosterItem"><span>${esc(p.name)} ${p.isHost?'<span class="hostTag">部屋主</span>':''}</span><span class="subtle">${s.phase==="playing"?`${p.cards}枚`:"参加中"}</span></div>`).join("")}</div>`}
-function bindShare(){const b=$("#shareBtn");if(b)b.onclick=async()=>{const link=`${location.origin}/?room=${roomCode}`;try{await navigator.clipboard.writeText(link);message("招待リンクをコピーしました") }catch{message(link)}}}
+function bindShare(){const b=$("#shareBtn");if(b)b.onclick=async()=>{const link=`${location.origin}${appBase}?room=${roomCode}`;try{await navigator.clipboard.writeText(link);message("招待リンクをコピーしました") }catch{message(link)}}}
 const ruleDefs=[
  {key:"spade3",name:"スペ3返し",desc:"単体ジョーカーに♠3を出して場を流す"},
  {key:"revolution",name:"革命",desc:"同じ数字4枚で強さが逆転"},
