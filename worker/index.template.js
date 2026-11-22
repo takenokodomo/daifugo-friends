@@ -1,0 +1,344 @@
+const APP_HTML = __APP_HTML__;
+
+const SUITS = ["clubs", "diamonds", "hearts", "spades"];
+const SYMBOLS = { clubs: "♣", diamonds: "♦", hearts: "♥", spades: "♠" };
+const RANKS = ["3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2"];
+const RANK_VALUE = Object.fromEntries([...RANKS, "JOKER"].map((rank, index) => [rank, index]));
+const SUIT_VALUE = Object.fromEntries(SUITS.map((suit, index) => [suit, index]));
+const MAX_AGE = 24 * 60 * 60 * 1000;
+const DEFAULT_RULES = { spade3: false, revolution: true, eightCut: true, nineCut: false, tenDiscard: false, elevenBack: false, qBomber: false, fourStop: false, rokurokubi: false, ambulance: false };
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+function card(rank, suit) {
+  return { id: `${rank}-${suit}`, rank, suit };
+}
+
+function shuffledDeck() {
+  const deck = [...SUITS.flatMap((suit) => RANKS.map((rank) => card(rank, suit))), { id: "joker", rank: "JOKER", suit: "joker" }];
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
+  }
+  return deck;
+}
+
+function cardOrder(a, b) {
+  return RANK_VALUE[a.rank] - RANK_VALUE[b.rank] || (SUIT_VALUE[a.suit] ?? 0) - (SUIT_VALUE[b.suit] ?? 0);
+}
+
+function nextActive(state, from, includeFrom = false) {
+  for (let step = includeFrom ? 0 : 1; step <= state.players.length; step++) {
+    const index = (from + step + state.players.length) % state.players.length;
+    const player = state.players[index];
+    if ((state.hands[player.id] || []).length > 0) return index;
+  }
+  return from;
+}
+
+function newState(host, name) {
+  return {
+    phase: "lobby", hostId: host, players: [{ id: host, name }], hands: {},
+    turn: 0, table: null, passes: 0, lastPlayer: null, revolution: false, back: false,
+    pendingEightCut: null, rules: { ...DEFAULT_RULES },
+    finishOrder: [], createdAt: Date.now(),
+  };
+}
+
+function publicState(state, viewerId) {
+  const current = state.players[state.turn];
+  return {
+    phase: state.phase,
+    isHost: state.hostId === viewerId,
+    players: state.players.map((player) => ({
+      name: player.name, cards: (state.hands[player.id] || []).length,
+      isHost: player.id === state.hostId, isYou: player.id === viewerId,
+      isTurn: current?.id === player.id,
+      place: state.finishOrder.indexOf(player.id) + 1 || null,
+    })),
+    hand: state.hands[viewerId] || [],
+    turnName: current?.name || "",
+    table: state.table ? { cards: state.table.cards, playerName: state.players.find((p) => p.id === state.table.playerId)?.name || "?" } : null,
+    passes: state.passes,
+    revolution: state.revolution,
+    back: state.back,
+    pendingEightCut: state.pendingEightCut ? { fourCount: state.pendingEightCut.fourCount } : null,
+    rules: state.rules,
+    finishOrder: state.finishOrder.map((id) => ({ name: state.players.find((p) => p.id === id)?.name || "?", isYou: id === viewerId })),
+    createdAt: state.createdAt,
+  };
+}
+
+async function getRoom(db, code) {
+  return db.prepare("SELECT state, version, updated_at FROM rooms WHERE code = ?")
+    .bind(code).first();
+}
+
+let schemaSetup;
+async function ensureSchema(db) {
+  if (!schemaSetup) schemaSetup = (async () => {
+    await db.prepare("CREATE TABLE IF NOT EXISTS rooms (code TEXT PRIMARY KEY, state TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)").run();
+    await db.prepare("CREATE INDEX IF NOT EXISTS rooms_updated_at_idx ON rooms(updated_at)").run();
+  })();
+  try { await schemaSetup; }
+  catch (error) { schemaSetup = null; throw error; }
+}
+
+async function saveRoom(db, code, row, state) {
+  const result = await db.prepare("UPDATE rooms SET state = ?, version = version + 1, updated_at = ? WHERE code = ? AND version = ?")
+    .bind(JSON.stringify(state), Date.now(), code, row.version).run();
+  return result.meta?.changes === 1;
+}
+
+async function createRoom(db, body) {
+  const id = crypto.randomUUID();
+  const name = String(body.name || "").trim().slice(0, 16);
+  if (!name) return json({ error: "名前を入力してください。" }, 400);
+  await db.prepare("DELETE FROM rooms WHERE updated_at < ?").bind(Date.now() - MAX_AGE).run();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const code = Array.from({ length: 5 }, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 32)]).join("");
+    const state = newState(id, name);
+    try {
+      await db.prepare("INSERT INTO rooms (code, state, version, updated_at) VALUES (?, ?, 1, ?)")
+        .bind(code, JSON.stringify(state), Date.now()).run();
+      return json({ code, playerId: id });
+    } catch (error) {
+      if (!String(error).toLowerCase().includes("unique")) throw error;
+    }
+  }
+  return json({ error: "部屋を作れませんでした。もう一度お試しください。" }, 500);
+}
+
+async function joinRoom(db, body) {
+  const code = String(body.code || "").trim().toUpperCase();
+  const id = String(body.playerId || "").slice(0, 64);
+  const name = String(body.name || "").trim().slice(0, 16);
+  if (!/^[A-HJ-NP-Z2-9]{5}$/.test(code) || !id || !name) return json({ error: "部屋コードと名前を確認してください。" }, 400);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await getRoom(db, code);
+    if (!row || Date.now() - row.updated_at > MAX_AGE) return json({ error: "部屋が見つかりません。コードを確認してください。" }, 404);
+    const state = JSON.parse(row.state);
+    if (state.players.some((p) => p.id === id)) return json({ code, playerId: id });
+    if (state.phase !== "lobby") return json({ error: "このゲームはすでに始まっています。" }, 409);
+    if (state.players.length >= 5) return json({ error: "この部屋は満員です（最大5人）。" }, 409);
+    state.players.push({ id, name });
+    if (await saveRoom(db, code, row, state)) return json({ code, playerId: id });
+  }
+  return json({ error: "参加が重なりました。もう一度お試しください。" }, 409);
+}
+
+async function updateRules(db, body) {
+  const code = String(body.code || "").trim().toUpperCase();
+  const id = String(body.playerId || "");
+  const requested = body.rules && typeof body.rules === "object" ? body.rules : {};
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await getRoom(db, code);
+    if (!row) return json({ error: "部屋が見つかりません。" }, 404);
+    const state = JSON.parse(row.state);
+    if (state.hostId !== id) return json({ error: "ルールを変更できるのは部屋主だけです。" }, 403);
+    if (state.phase !== "lobby") return json({ error: "ゲーム開始後はルールを変更できません。" }, 409);
+    state.rules = Object.fromEntries(Object.keys(DEFAULT_RULES).map((key) => [key, key in requested ? requested[key] === true : (state.rules || DEFAULT_RULES)[key] === true]));
+    if (await saveRoom(db, code, row, state)) return json({ ok: true });
+  }
+  return json({ error: "ルール変更が重なりました。もう一度お試しください。" }, 409);
+}
+
+async function startGame(db, body) {
+  const code = String(body.code || "").trim().toUpperCase();
+  const id = String(body.playerId || "");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await getRoom(db, code);
+    if (!row) return json({ error: "部屋が見つかりません。" }, 404);
+    const state = JSON.parse(row.state);
+    if (state.hostId !== id) return json({ error: "ゲームを始められるのは部屋主だけです。" }, 403);
+    if (state.phase !== "lobby") return json({ error: "ゲームはすでに始まっています。" }, 409);
+    if (state.players.length < 3) return json({ error: "ゲーム開始には3人以上必要です。" }, 400);
+    const deck = shuffledDeck();
+    const requested = body.rules && typeof body.rules === "object" ? body.rules : (state.rules || DEFAULT_RULES);
+    state.rules = Object.fromEntries(Object.keys(DEFAULT_RULES).map((key) => [key, key in requested ? requested[key] === true : DEFAULT_RULES[key]]));
+    const hands = Object.fromEntries(state.players.map((p) => [p.id, []]));
+    deck.forEach((item, index) => hands[state.players[index % state.players.length].id].push(item));
+    Object.values(hands).forEach((hand) => hand.sort(cardOrder));
+    state.hands = hands;
+    state.turn = state.players.findIndex((p) => hands[p.id].some((item) => item.id === "3-clubs"));
+    state.phase = "playing";
+    if (await saveRoom(db, code, row, state)) return json({ ok: true });
+  }
+  return json({ error: "開始操作が重なりました。もう一度お試しください。" }, 409);
+}
+
+function validSet(cards) {
+  if (!Array.isArray(cards) || cards.length < 1 || cards.length > 4) return false;
+  return cards.every((item) => item.rank === cards[0].rank);
+}
+
+function beats(cards, table, reversed, rules) {
+  if (!validSet(cards)) return false;
+  if (!table) return true;
+  if (cards.length !== table.cards.length) return false;
+  const topJoker = table.cards.length === 1 && table.cards[0].rank === "JOKER";
+  const pickedSpade3 = cards.length === 1 && cards[0].id === "3-spades";
+  if (topJoker) return rules.spade3 && pickedSpade3;
+  if (pickedSpade3 && table.cards.length === 1 && table.cards[0].id === "3-spades") return false;
+  const strength = (group) => RANK_VALUE[group[0].rank] * 4 + Math.max(...group.map((item) => SUIT_VALUE[item.suit] ?? 0));
+  const candidate = strength(cards), previous = strength(table.cards);
+  return reversed ? candidate < previous : candidate > previous;
+}
+
+function clearTrick(state, leaderId) {
+  state.table = null;
+  state.pendingEightCut = null;
+  state.passes = 0;
+  state.back = false;
+  const leaderIndex = state.players.findIndex((p) => p.id === leaderId);
+  state.turn = nextActive(state, leaderIndex < 0 ? state.turn : leaderIndex, true);
+}
+
+function finishEmptyHands(state, firstPlayerId) {
+  const first = state.players.findIndex((p) => p.id === firstPlayerId);
+  for (let step = 0; step < state.players.length; step++) {
+    const player = state.players[(Math.max(0, first) + step) % state.players.length];
+    if ((state.hands[player.id] || []).length === 0 && !state.finishOrder.includes(player.id)) state.finishOrder.push(player.id);
+  }
+  const remaining = state.players.filter((p) => (state.hands[p.id] || []).length > 0);
+  if (remaining.length <= 1) {
+    if (remaining.length === 1 && !state.finishOrder.includes(remaining[0].id)) state.finishOrder.push(remaining[0].id);
+    state.phase = "finished";
+    state.pendingEightCut = null;
+  }
+}
+
+async function act(db, body) {
+  const code = String(body.code || "").trim().toUpperCase();
+  const id = String(body.playerId || "");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await getRoom(db, code);
+    if (!row) return json({ error: "部屋が見つかりません。" }, 404);
+    const state = JSON.parse(row.state);
+    if (state.phase !== "playing") return json({ error: "ゲーム中ではありません。" }, 409);
+    if (state.players[state.turn]?.id !== id) return json({ error: "あなたの番ではありません。" }, 409);
+    const hand = state.hands[id] || [];
+    const action = body.action;
+    const rules = { ...DEFAULT_RULES, ...(state.rules || {}) };
+    if (state.pendingEightCut && action === "stop8") {
+      const requiredFours = state.pendingEightCut.fourCount;
+      const fours = hand.filter((item) => item.rank === "4");
+      if (fours.length < requiredFours) return json({ error: `4を${requiredFours}枚持っていないため、4止めできません。` }, 400);
+      const picked = fours.slice(0, requiredFours);
+      state.hands[id] = hand.filter((item) => !picked.some((four) => four.id === item.id));
+      state.lastPlayer = id;
+      state.table = null;
+      state.pendingEightCut = null;
+      state.passes = 0;
+      state.back = false;
+      finishEmptyHands(state, id);
+      if (state.phase !== "finished") state.turn = state.players.findIndex((p) => p.id === id);
+      if (await saveRoom(db, code, row, state)) return json({ ok: true });
+      continue;
+    }
+    if (state.pendingEightCut && action === "pass") {
+      const leaderId = state.pendingEightCut.playerId;
+      clearTrick(state, leaderId);
+      if (await saveRoom(db, code, row, state)) return json({ ok: true });
+      continue;
+    }
+    if (action === "play") {
+      const ids = Array.isArray(body.cards) ? [...new Set(body.cards.map(String))] : [];
+      const picked = ids.map((cardId) => hand.find((item) => item.id === cardId));
+      if (picked.some((item) => !item) || !beats(picked, state.table, state.revolution !== state.back, rules)) return json({ error: "そのカードでは出せません。枚数と強さを確認してください。" }, 400);
+      if (state.pendingEightCut) return json({ error: "8切りへの対応を選んでください。" }, 400);
+      if (!state.table && hand.some((item) => item.id === "3-clubs") && !picked.some((item) => item.id === "3-clubs")) return json({ error: "最初の一手には♣3を含めてください。" }, 400);
+      if (state.table?.cards.length === 1 && state.table.cards[0].rank === "8" && rules.fourStop) return json({ error: "8切りは4止めかパスで対応してください。" }, 400);
+      if (state.table?.cards.length === 1 && state.table.cards[0].rank === "8" && rules.eightCut) return json({ error: "8切りは4止めかパスで対応してください。" }, 400);
+      if (picked.some((item) => item.rank === "8") && !rules.eightCut) return json({ error: "8切りはこの部屋で無効です。" }, 400);
+      if (picked.some((item) => item.rank === "9") && rules.nineCut) {
+        // 9切り is an optional immediate trick clear.
+      }
+      if (state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && rules.spade3 && !(picked.length === 1 && picked[0].id === "3-spades")) return json({ error: "ジョーカーには♠3で返してください。" }, 400);
+      const discardIds = Array.isArray(body.discard) ? [...new Set(body.discard.map(String))] : [];
+      const tenLimit = rules.tenDiscard ? picked.filter((item) => item.rank === "10").length : 0;
+      if (discardIds.length > tenLimit || discardIds.some((discardId) => !hand.some((item) => item.id === discardId) || ids.includes(discardId))) return json({ error: "10捨ての枚数を確認してください。" }, 400);
+      const bombRanks = Array.isArray(body.bombRanks) ? [...new Set(body.bombRanks.map(String))] : [];
+      const bombLimit = rules.qBomber ? picked.filter((item) => item.rank === "Q").length : 0;
+      if (bombRanks.length > bombLimit || bombRanks.some((rank) => !RANKS.includes(rank) && rank !== "JOKER")) return json({ error: "Qボンバーの指定を確認してください。" }, 400);
+      const spade3Return = rules.spade3 && state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && picked.length === 1 && picked[0].id === "3-spades";
+      state.hands[id] = hand.filter((item) => !ids.includes(item.id));
+      state.hands[id] = state.hands[id].filter((item) => !discardIds.includes(item.id));
+      state.table = { cards: picked, playerId: id };
+      state.lastPlayer = id;
+      state.passes = 0;
+      if (rules.revolution && picked.length === 4) state.revolution = !state.revolution;
+      if (rules.elevenBack && picked.some((item) => item.rank === "J")) state.back = !state.back;
+      if (rules.qBomber && bombRanks.length) {
+        for (const player of state.players) state.hands[player.id] = (state.hands[player.id] || []).filter((item) => !bombRanks.includes(item.rank));
+      }
+      finishEmptyHands(state, id);
+      const has8 = rules.eightCut && picked.some((item) => item.rank === "8");
+      const has9 = rules.nineCut && picked.some((item) => item.rank === "9");
+      const has66 = rules.rokurokubi && picked.length === 2 && picked.every((item) => item.rank === "6");
+      const has99 = rules.ambulance && picked.length === 2 && picked.every((item) => item.rank === "9");
+      if (state.phase !== "finished" && rules.fourStop && has8) {
+        state.pendingEightCut = { playerId: id, fourCount: picked.filter((item) => item.rank === "8").length * 2 };
+        state.turn = nextActive(state, state.players.findIndex((p) => p.id === id));
+      } else if (state.phase !== "finished" && (has8 || has9 || has66 || has99 || spade3Return)) {
+        clearTrick(state, id);
+      } else if (state.phase !== "finished") {
+        state.turn = nextActive(state, state.turn);
+      }
+    } else if (action === "pass") {
+      if (!state.table) return json({ error: "場が流れています。最初のカードを出してください。" }, 400);
+      state.passes++;
+      const activeCount = state.players.filter((p) => (state.hands[p.id] || []).length > 0).length;
+      if (state.passes >= activeCount - 1) {
+        clearTrick(state, state.lastPlayer);
+      } else {
+        state.turn = nextActive(state, state.turn);
+      }
+    } else {
+      return json({ error: "不明な操作です。" }, 400);
+    }
+    if (await saveRoom(db, code, row, state)) return json({ ok: true });
+  }
+  return json({ error: "操作が重なりました。画面が更新されてから再度お試しください。" }, 409);
+}
+
+async function route(request, env) {
+  const url = new URL(request.url);
+  if (request.method === "GET" && url.pathname === "/") {
+    return new Response(APP_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  }
+  if (!url.pathname.startsWith("/api/")) return new Response("Not found", { status: 404 });
+  if (!env.DB) return json({ error: "対戦データベースを準備しています。数分後に再読み込みしてください。" }, 503);
+  try {
+    await ensureSchema(env.DB);
+    if (request.method === "POST" && url.pathname === "/api/rooms") return await createRoom(env.DB, await request.json());
+    if (request.method === "POST" && url.pathname === "/api/join") return await joinRoom(env.DB, await request.json());
+    if (request.method === "POST" && url.pathname === "/api/rules") return await updateRules(env.DB, await request.json());
+    if (request.method === "POST" && url.pathname === "/api/start") return await startGame(env.DB, await request.json());
+    if (request.method === "POST" && url.pathname === "/api/action") return await act(env.DB, await request.json());
+    if (request.method === "GET" && url.pathname === "/api/room") {
+      const code = String(url.searchParams.get("code") || "").toUpperCase();
+      const playerId = String(url.searchParams.get("playerId") || "");
+      const row = await getRoom(env.DB, code);
+      if (!row || Date.now() - row.updated_at > MAX_AGE) return json({ error: "部屋が見つかりません。" }, 404);
+      const state = JSON.parse(row.state);
+      if (!state.players.some((p) => p.id === playerId)) return json({ error: "この部屋の参加者ではありません。" }, 403);
+      return json(publicState(state, playerId));
+    }
+    return json({ error: "Not found" }, 404);
+  } catch (error) {
+    return json({ error: "通信に失敗しました。接続を確認してください。" }, 500);
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    try { return await route(request, env); }
+    catch { return json({ error: "サーバーでエラーが発生しました。" }, 500); }
+  },
+};
