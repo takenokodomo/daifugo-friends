@@ -79,6 +79,9 @@ function setState({ hands, rules }) {
   state.passes = 0;
   state.lastPlayer = null;
   state.pendingEightCut = null;
+  state.passedPlayers = [];
+  state.currentPasses = [];
+  state.openingMove = false;
   state.events = [];
   state.rules = { ...state.rules, revolution: false, fourStop: false, ...rules };
   db.rooms.set(code, { ...row, state: JSON.stringify(state), updated_at: Date.now() });
@@ -149,6 +152,28 @@ assert.equal(view.data.table, null, "残りのプレイヤーがパスすると�
 assert.equal(view.data.players.find(p => p.name === "A").isTurn, true, "場が流れた後は最後に出した人へ戻る");
 
 setState({
+  hands: { [a]: [card("6", "clubs"), card("9", "diamonds")], [b]: [card("5", "clubs"), card("8", "hearts")], [c]: [card("7", "diamonds"), card("10", "diamonds")] },
+  rules: { passSkip: true },
+});
+await call("/api/action", { code, playerId: a, action: "play", cards: ["6-clubs"] });
+await call("/api/action", { code, playerId: b, action: "pass" });
+await call("/api/action", { code, playerId: c, action: "play", cards: ["7-diamonds"] });
+view = await call(`/api/room?code=${code}&playerId=${a}`);
+assert.equal(view.data.players.find(p => p.name === "B").hasPassed, true, "パス後スキップ設定では、他の人が出してもパス状態を維持する");
+assert.equal(view.data.players.find(p => p.name === "A").isTurn, true, "パス済みの人を場が流れるまで飛ばす");
+assert.equal((await call("/api/action", { code, playerId: b, action: "play", cards: ["8-hearts"] })).status, 409, "パス済みプレイヤーは場が流れるまで出せない");
+
+setState({
+  hands: { [a]: [card("6", "clubs"), card("9", "diamonds")], [b]: [card("5", "clubs"), card("8", "hearts")], [c]: [card("7", "diamonds"), card("10", "diamonds")] },
+  rules: { passSkip: false },
+});
+await call("/api/action", { code, playerId: a, action: "play", cards: ["6-clubs"] });
+await call("/api/action", { code, playerId: b, action: "pass" });
+await call("/api/action", { code, playerId: c, action: "play", cards: ["7-diamonds"] });
+await call("/api/action", { code, playerId: a, action: "pass" });
+assert.equal((await call("/api/action", { code, playerId: b, action: "play", cards: ["8-hearts"] })).status, 200, "スキップ無効なら一度パスした人も再参加できる");
+
+setState({
   hands: { [a]: [card("6", "clubs"), card("7", "diamonds")], [b]: [card("5", "clubs"), card("8", "hearts")], [c]: [card("9", "diamonds"), card("J", "spades")] },
   rules: { eightCut: true },
 });
@@ -184,16 +209,54 @@ assert.equal((await call("/api/leave", { code: largeCode, playerId: "late-observ
 const privateView = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[0].id}`);
 assert.equal(privateView.data.spectatorMode, false);
 assert.equal(privateView.data.players[1].hand, undefined, "通常画面では他プレイヤーのカードを公開しない");
-const spectatorView = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[0].id}&spectate=1`);
-assert.equal(spectatorView.data.spectatorMode, true);
+const activePeek = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[0].id}&spectate=1`);
+assert.equal(activePeek.data.spectatorMode, false, "上がる前のプレイヤーは観戦APIで手札を見られない");
+assert.equal(activePeek.data.players[1].hand, undefined);
+let spectatorView = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[0].id}&spectate=1`);
+assert.equal(spectatorView.data.spectatorMode, false, "現役プレイヤーは観戦モードへ移動できない");
+assert.equal(spectatorView.data.players[1].hand, undefined);
+const finishedPlayerState = JSON.parse(db.rooms.get(largeCode).state);
+finishedPlayerState.finishOrder = [largePlayers[0].id];
+db.rooms.set(largeCode, { ...db.rooms.get(largeCode), state: JSON.stringify(finishedPlayerState) });
+const finishedPlayerView = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[0].id}&spectate=1`);
+assert.equal(finishedPlayerView.data.spectatorMode, true, "上がったプレイヤーは観戦モードへ移動できる");
+spectatorView = finishedPlayerView;
 assert.equal(spectatorView.data.deckCount, 2);
 assert.equal(spectatorView.data.players.length, 12);
 assert.equal(spectatorView.data.players.reduce((sum, player) => sum + player.hand.length, 0), 106, "2デッキ分の全手札を観戦画面へ返す");
 assert.equal(new Set(spectatorView.data.players.flatMap(player => player.hand.map(item => item.id))).size, 106, "2デッキのカードIDが重複しない");
 const largeRow = db.rooms.get(largeCode), largeState = JSON.parse(largeRow.state);
-largeState.hands = Object.fromEntries(largePlayers.map((player, index) => [player.id, index ? [card("6", "hearts")] : [card("3", "clubs"), { ...card("3", "clubs"), id: "3-clubs-2" }, card("5", "clubs")]]));
-largeState.turn = 0; largeState.table = null; largeState.lastPlayer = null; largeState.passes = 0; largeState.passedPlayers = []; largeState.openingMove = true; largeState.finishOrder = []; largeState.events = []; largeState.rules.eightCut = false;
+largeState.hands = Object.fromEntries(largePlayers.map((player, index) => [player.id, index === 0 ? [card("5", "clubs"), card("5", "hearts"), card("9", "diamonds")] : index < 4 ? [card(String(5 + index), "clubs")] : []]));
+largeState.turn = 0; largeState.table = null; largeState.lastPlayer = null; largeState.passes = 0; largeState.passedPlayers = []; largeState.currentPasses = []; largeState.openingMove = false; largeState.finishOrder = []; largeState.events = []; largeState.rules = { ...largeState.rules, fiveSkip: true, sevenGive: false, passSkip: false };
 db.rooms.set(largeCode, { ...largeRow, state: JSON.stringify(largeState) });
+assert.equal((await call("/api/action", { code: largeCode, playerId: largePlayers[0].id, action: "play", cards: ["5-clubs", "5-hearts"] })).status, 200, "ペアの5でスキップできる");
+const fiveSkipView = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[3].id}`);
+assert.equal(fiveSkipView.data.players.find(p => p.name === "P1").isTurn, false, "5スキップでは最初の相手を飛ばす");
+assert.equal(fiveSkipView.data.players.find(p => p.name === "P2").isTurn, false, "5を2枚出すと次の2人を飛ばす");
+assert.equal(fiveSkipView.data.players.find(p => p.name === "P3").isTurn, true, "5を2枚出した次の相手が手番になる");
+assert.equal(fiveSkipView.data.events.at(-1).skippedPlayerNames.join(","), "P1,P2");
+
+const giveRow = db.rooms.get(largeCode), giveState = JSON.parse(giveRow.state);
+giveState.hands = Object.fromEntries(largePlayers.map((player, index) => [player.id, index === 0 ? [card("7", "clubs"), card("6", "diamonds"), card("9", "hearts")] : index < 4 ? [card(String(3 + index), "clubs")] : []]));
+giveState.turn = 0; giveState.table = null; giveState.lastPlayer = null; giveState.passes = 0; giveState.passedPlayers = []; giveState.currentPasses = []; giveState.openingMove = false; giveState.finishOrder = []; giveState.events = []; giveState.rules = { ...giveState.rules, fiveSkip: false, sevenGive: true, passSkip: false };
+db.rooms.set(largeCode, { ...giveRow, state: JSON.stringify(giveState) });
+assert.equal((await call("/api/action", { code: largeCode, playerId: largePlayers[0].id, action: "play", cards: ["7-clubs"], give: ["6-diamonds"] })).status, 200, "7を出して手札を次の人へ渡せる");
+const giveView = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[2].id}`);
+assert.equal(giveView.data.players.find(p => p.name === "Host").cards, 1, "渡したカードを出した人の手札から除く");
+assert.equal(giveView.data.players.find(p => p.name === "P1").cards, 2, "渡したカードを次の人の手札へ加える");
+assert.equal(giveView.data.events.at(-1).type, "seven_give");
+assert.equal(giveView.data.events.at(-1).relatedPlayerName, "P1");
+assert.equal(giveView.data.events.at(-1).givenCount, 1);
+const illegalGiveRow = db.rooms.get(largeCode), illegalGiveState = JSON.parse(illegalGiveRow.state);
+illegalGiveState.turn = 0; illegalGiveState.table = null; illegalGiveState.lastPlayer = null;
+db.rooms.set(largeCode, { ...illegalGiveRow, state: JSON.stringify(illegalGiveState) });
+assert.equal((await call("/api/action", { code: largeCode, playerId: largePlayers[0].id, action: "play", cards: ["9-hearts"], give: ["6-diamonds"] })).status, 400, "7以外では7渡しできない");
+
+const openingRow = db.rooms.get(largeCode), openingState = JSON.parse(openingRow.state);
+Object.assign(largeState, openingState);
+largeState.hands = Object.fromEntries(largePlayers.map((player, index) => [player.id, index ? [card("6", "hearts")] : [card("3", "clubs"), { ...card("3", "clubs"), id: "3-clubs-2" }, card("5", "clubs")]]));
+largeState.turn = 0; largeState.table = null; largeState.lastPlayer = null; largeState.passes = 0; largeState.passedPlayers = []; largeState.currentPasses = []; largeState.openingMove = true; largeState.finishOrder = []; largeState.events = []; largeState.rules.eightCut = false;
+db.rooms.set(largeCode, { ...openingRow, state: JSON.stringify(largeState) });
 assert.equal((await call("/api/action", { code: largeCode, playerId: largePlayers[0].id, action: "play", cards: ["3-clubs"] })).status, 200, "最初の手に複数組の♣3を出せる");
 for (const player of largePlayers.slice(1)) assert.equal((await call("/api/action", { code: largeCode, playerId: player.id, action: "pass" })).status, 200);
 assert.equal((await call(`/api/room?code=${largeCode}&playerId=${largePlayers[0].id}`)).data.openingMove, false, "最初の一手の制限は初回だけ");

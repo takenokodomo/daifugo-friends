@@ -7,7 +7,7 @@ const RANK_VALUE = Object.fromEntries([...RANKS, "JOKER"].map((rank, index) => [
 const SUIT_VALUE = Object.fromEntries(SUITS.map((suit, index) => [suit, index]));
 const MAX_AGE = 24 * 60 * 60 * 1000;
 const MAX_PLAYERS = 12;
-const DEFAULT_RULES = { spade3: false, revolution: true, eightCut: true, nineCut: false, tenDiscard: false, elevenBack: false, qBomber: false, fourStop: false, rokurokubi: false, ambulance: false };
+const DEFAULT_RULES = { spade3: false, revolution: true, eightCut: true, nineCut: false, tenDiscard: false, elevenBack: false, qBomber: false, fourStop: false, rokurokubi: false, ambulance: false, passSkip: false, fiveSkip: false, sevenGive: false };
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -40,7 +40,7 @@ function nextActive(state, from, includeFrom = false) {
   for (let step = includeFrom ? 0 : 1; step <= state.players.length; step++) {
     const index = (from + step + state.players.length) % state.players.length;
     const player = state.players[index];
-    if ((state.hands[player.id] || []).length > 0 && (!state.table || !(state.passedPlayers || []).includes(player.id))) return index;
+    if ((state.hands[player.id] || []).length > 0 && (!state.table || !state.rules?.passSkip || !(state.passedPlayers || []).includes(player.id))) return index;
   }
   return from;
 }
@@ -49,7 +49,7 @@ function newState(host, name) {
   return {
     phase: "lobby", hostId: host, players: [{ id: host, name }], spectators: [], hands: {},
     turn: 0, table: null, passes: 0, lastPlayer: null, revolution: false, back: false, openingMove: false,
-    pendingEightCut: null, passedPlayers: [], events: [], rules: { ...DEFAULT_RULES },
+    pendingEightCut: null, passedPlayers: [], currentPasses: [], events: [], rules: { ...DEFAULT_RULES },
     finishOrder: [], deckCount: 1, createdAt: Date.now(),
   };
 }
@@ -57,7 +57,8 @@ function newState(host, name) {
 function publicState(state, viewerId, spectatorMode = false) {
   const current = state.players[state.turn];
   const isSpectator = (state.spectators || []).some((spectator) => spectator.id === viewerId);
-  const revealHands = (spectatorMode || isSpectator) && state.phase !== "lobby";
+  const isFinishedPlayer = (state.finishOrder || []).includes(viewerId);
+  const revealHands = state.phase !== "lobby" && (isSpectator || (spectatorMode && (isFinishedPlayer || state.phase === "finished")));
   return {
     phase: state.phase,
     spectatorMode: revealHands,
@@ -89,6 +90,8 @@ function publicState(state, viewerId, spectatorMode = false) {
       relatedPlayerName: event.relatedPlayerName || (event.relatedPlayerId ? (state.players.find((player) => player.id === event.relatedPlayerId)?.name || "?") : null),
       isYou: event.playerId === viewerId,
       cards: event.cards || [],
+      givenCount: event.givenCount || 0,
+      skippedPlayerNames: event.skippedPlayerNames || [],
       at: event.at,
     })),
     rules: state.rules,
@@ -186,7 +189,8 @@ async function leaveRoom(db, body) {
     delete state.hands[id];
     state.finishOrder = (state.finishOrder || []).filter((playerId) => playerId !== id);
     state.passedPlayers = (state.passedPlayers || []).filter((playerId) => playerId !== id);
-    state.passes = state.passedPlayers.length;
+    state.currentPasses = (state.currentPasses || []).filter((playerId) => playerId !== id);
+    state.passes = state.currentPasses.length;
     if (state.hostId === id) state.hostId = state.players[0]?.id || null;
     if (!state.players.length) {
       await db.prepare("DELETE FROM rooms WHERE code = ?").bind(code).run();
@@ -196,7 +200,9 @@ async function leaveRoom(db, body) {
       const activePlayers = state.players.filter((player) => (state.hands[player.id] || []).length > 0);
       if (activePlayers.length <= 1) {
         finishEmptyHands(state, activePlayers[0]?.id || state.players[0].id);
-      } else if (state.table && !wasLeader && state.passes >= activePlayers.length - 1) {
+      } else if (state.table && !wasLeader && (state.rules?.passSkip
+        ? activePlayers.every((player) => player.id === state.lastPlayer || (state.passedPlayers || []).includes(player.id))
+        : (state.currentPasses || []).length >= activePlayers.length - 1)) {
         const leaderId = state.lastPlayer;
         const playedCards = state.table.cards;
         clearTrick(state, leaderId);
@@ -207,6 +213,7 @@ async function leaveRoom(db, body) {
         state.lastPlayer = null;
         state.passes = 0;
         state.passedPlayers = [];
+        state.currentPasses = [];
         const nextIndex = Math.min(index, state.players.length - 1);
         state.turn = nextActive(state, nextIndex - 1, false);
       } else if (currentPlayerId === id) {
@@ -261,6 +268,7 @@ async function startGame(db, body) {
     Object.values(hands).forEach((hand) => hand.sort(cardOrder));
     state.hands = hands;
     state.passedPlayers = [];
+    state.currentPasses = [];
     state.openingMove = true;
     state.turn = state.players.findIndex((p) => hands[p.id].some((item) => item.rank === "3" && item.suit === "clubs"));
     state.phase = "playing";
@@ -288,6 +296,7 @@ async function rematch(db, body) {
     state.back = false;
     state.pendingEightCut = null;
     state.passedPlayers = [];
+    state.currentPasses = [];
     state.finishOrder = [];
     state.events = [];
     state.openingMove = true;
@@ -325,6 +334,7 @@ function clearTrick(state, leaderId) {
   state.pendingEightCut = null;
   state.passes = 0;
   state.passedPlayers = [];
+  state.currentPasses = [];
   state.back = false;
   const leaderIndex = state.players.findIndex((p) => p.id === leaderId);
   state.turn = nextActive(state, leaderIndex < 0 ? state.turn : leaderIndex, true);
@@ -410,14 +420,29 @@ async function act(db, body) {
       const bombRanks = Array.isArray(body.bombRanks) ? [...new Set(body.bombRanks.map(String))] : [];
       const bombLimit = rules.qBomber && playRank === "Q" ? picked.length : 0;
       if (bombRanks.length > bombLimit || bombRanks.some((rank) => !RANKS.includes(rank) && rank !== "JOKER")) return json({ error: "Qボンバーの指定を確認してください。" }, 400);
+      const giveIds = Array.isArray(body.give) ? [...new Set(body.give.map(String))] : [];
+      const giveLimit = rules.sevenGive && playRank === "7" ? picked.length : 0;
+      if (giveIds.length > giveLimit || giveIds.some((giveId) => !hand.some((item) => item.id === giveId) || ids.includes(giveId) || discardIds.includes(giveId))) return json({ error: "7渡しの枚数またはカードを確認してください。" }, 400);
       const spade3Return = rules.spade3 && state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && picked.length === 1 && picked[0].rank === "3" && picked[0].suit === "spades";
       state.hands[id] = hand.filter((item) => !ids.includes(item.id));
       state.openingMove = false;
       state.hands[id] = state.hands[id].filter((item) => !discardIds.includes(item.id));
+      if (!rules.passSkip) state.passedPlayers = [];
+      state.currentPasses = [];
+      state.passes = 0;
+      let sevenRecipientId = null;
+      if (giveIds.length) {
+        const senderIndex = state.players.findIndex((player) => player.id === id);
+        const recipient = state.players[nextActive(state, senderIndex)];
+        const givenCards = state.hands[id].filter((item) => giveIds.includes(item.id));
+        if (!recipient || recipient.id === id || givenCards.length !== giveIds.length) return json({ error: "7渡しを受け取る相手がいません。" }, 409);
+        state.hands[id] = state.hands[id].filter((item) => !giveIds.includes(item.id));
+        state.hands[recipient.id] = [...(state.hands[recipient.id] || []), ...givenCards].sort(cardOrder);
+        sevenRecipientId = recipient.id;
+      }
       state.table = { cards: picked, playerId: id };
       state.lastPlayer = id;
       state.passes = 0;
-      state.passedPlayers = [];
       if (rules.revolution && picked.length === 4) state.revolution = !state.revolution;
       if (rules.elevenBack && playRank === "J") state.back = !state.back;
       if (rules.qBomber && bombRanks.length) {
@@ -436,17 +461,35 @@ async function act(db, body) {
         clearTrick(state, id);
         recordEvent(state, has8 ? "eight_cut" : "special_clear", id, picked);
       } else if (state.phase !== "finished") {
-        recordEvent(state, "play", id, picked);
+        const activeCount = state.players.filter((player) => (state.hands[player.id] || []).length > 0).length;
+        const fiveSkipCount = rules.fiveSkip && playRank === "5" ? Math.min(picked.length, Math.max(0, activeCount - 1)) : 0;
+        recordEvent(state, sevenRecipientId ? "seven_give" : fiveSkipCount ? "five_skip" : "play", id, picked, sevenRecipientId);
+        if (sevenRecipientId) state.events[state.events.length - 1].givenCount = giveIds.length;
         state.turn = nextActive(state, state.turn);
+        if (fiveSkipCount) {
+          const skippedPlayerNames = [];
+          for (let skipped = 0; skipped < fiveSkipCount; skipped++) {
+            const skippedPlayer = state.players[state.turn];
+            if (!skippedPlayer || skippedPlayer.id === id) break;
+            skippedPlayerNames.push(skippedPlayer.name);
+            state.turn = nextActive(state, state.turn);
+          }
+          state.events[state.events.length - 1].skippedPlayerNames = skippedPlayerNames;
+        }
       } else {
         recordEvent(state, has8 ? "eight_cut" : "play", id, picked);
       }
     } else if (action === "pass") {
       if (!state.table) return json({ error: "場が流れています。最初のカードを出してください。" }, 400);
+      state.currentPasses = [...new Set([...(state.currentPasses || []), id])];
       state.passedPlayers = [...new Set([...(state.passedPlayers || []), id])];
-      state.passes = state.passedPlayers.length;
+      state.passes = state.currentPasses.length;
       const activeCount = state.players.filter((p) => (state.hands[p.id] || []).length > 0).length;
-      if (state.passes >= activeCount - 1) {
+      const allEligiblePlayersPassed = state.rules?.passSkip
+        ? state.players.filter((player) => (state.hands[player.id] || []).length > 0)
+            .every((player) => player.id === state.lastPlayer || state.passedPlayers.includes(player.id))
+        : state.passes >= activeCount - 1;
+      if (allEligiblePlayersPassed) {
         const leaderId = state.lastPlayer;
         const playedCards = state.table.cards;
         clearTrick(state, leaderId);
