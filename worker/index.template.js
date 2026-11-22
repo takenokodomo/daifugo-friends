@@ -172,9 +172,15 @@ async function startGame(db, body) {
   return json({ error: "開始操作が重なりました。もう一度お試しください。" }, 409);
 }
 
+function effectiveRank(cards) {
+  return cards.find((item) => item.rank !== "JOKER")?.rank || "JOKER";
+}
+
 function validSet(cards) {
   if (!Array.isArray(cards) || cards.length < 1 || cards.length > 4) return false;
-  return cards.every((item) => item.rank === cards[0].rank);
+  const rank = effectiveRank(cards);
+  if (rank === "JOKER") return cards.length === 1;
+  return cards.every((item) => item.rank === "JOKER" || item.rank === rank);
 }
 
 function beats(cards, table, reversed, rules) {
@@ -185,7 +191,7 @@ function beats(cards, table, reversed, rules) {
   const pickedSpade3 = cards.length === 1 && cards[0].id === "3-spades";
   if (topJoker) return rules.spade3 && pickedSpade3;
   if (pickedSpade3 && table.cards.length === 1 && table.cards[0].id === "3-spades") return false;
-  const strength = (group) => RANK_VALUE[group[0].rank] * 4 + Math.max(...group.map((item) => SUIT_VALUE[item.suit] ?? 0));
+  const strength = (group) => RANK_VALUE[effectiveRank(group)] * 4 + Math.max(0, ...group.filter((item) => item.rank !== "JOKER").map((item) => SUIT_VALUE[item.suit] ?? 0));
   const candidate = strength(cards), previous = strength(table.cards);
   return reversed ? candidate < previous : candidate > previous;
 }
@@ -227,7 +233,7 @@ async function act(db, body) {
     const rules = { ...DEFAULT_RULES, ...(state.rules || {}) };
     if (state.pendingEightCut && action === "stop8") {
       const requiredFours = state.pendingEightCut.fourCount;
-      const fours = hand.filter((item) => item.rank === "4");
+      const fours = hand.filter((item) => item.rank === "4" || item.rank === "JOKER");
       if (fours.length < requiredFours) return json({ error: `4を${requiredFours}枚持っていないため、4止めできません。` }, 400);
       const picked = fours.slice(0, requiredFours);
       state.hands[id] = hand.filter((item) => !picked.some((four) => four.id === item.id));
@@ -251,20 +257,21 @@ async function act(db, body) {
       const ids = Array.isArray(body.cards) ? [...new Set(body.cards.map(String))] : [];
       const picked = ids.map((cardId) => hand.find((item) => item.id === cardId));
       if (picked.some((item) => !item) || !beats(picked, state.table, state.revolution !== state.back, rules)) return json({ error: "そのカードでは出せません。枚数と強さを確認してください。" }, 400);
+      const playRank = effectiveRank(picked);
       if (state.pendingEightCut) return json({ error: "8切りへの対応を選んでください。" }, 400);
       if (!state.table && hand.some((item) => item.id === "3-clubs") && !picked.some((item) => item.id === "3-clubs")) return json({ error: "最初の一手には♣3を含めてください。" }, 400);
       if (state.table?.cards.length === 1 && state.table.cards[0].rank === "8" && rules.fourStop) return json({ error: "8切りは4止めかパスで対応してください。" }, 400);
       if (state.table?.cards.length === 1 && state.table.cards[0].rank === "8" && rules.eightCut) return json({ error: "8切りは4止めかパスで対応してください。" }, 400);
-      if (picked.some((item) => item.rank === "8") && !rules.eightCut) return json({ error: "8切りはこの部屋で無効です。" }, 400);
-      if (picked.some((item) => item.rank === "9") && rules.nineCut) {
+      if (playRank === "8" && !rules.eightCut) return json({ error: "8切りはこの部屋で無効です。" }, 400);
+      if (playRank === "9" && rules.nineCut) {
         // 9切り is an optional immediate trick clear.
       }
       if (state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && rules.spade3 && !(picked.length === 1 && picked[0].id === "3-spades")) return json({ error: "ジョーカーには♠3で返してください。" }, 400);
       const discardIds = Array.isArray(body.discard) ? [...new Set(body.discard.map(String))] : [];
-      const tenLimit = rules.tenDiscard ? picked.filter((item) => item.rank === "10").length : 0;
+      const tenLimit = rules.tenDiscard && playRank === "10" ? picked.length : 0;
       if (discardIds.length > tenLimit || discardIds.some((discardId) => !hand.some((item) => item.id === discardId) || ids.includes(discardId))) return json({ error: "10捨ての枚数を確認してください。" }, 400);
       const bombRanks = Array.isArray(body.bombRanks) ? [...new Set(body.bombRanks.map(String))] : [];
-      const bombLimit = rules.qBomber ? picked.filter((item) => item.rank === "Q").length : 0;
+      const bombLimit = rules.qBomber && playRank === "Q" ? picked.length : 0;
       if (bombRanks.length > bombLimit || bombRanks.some((rank) => !RANKS.includes(rank) && rank !== "JOKER")) return json({ error: "Qボンバーの指定を確認してください。" }, 400);
       const spade3Return = rules.spade3 && state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && picked.length === 1 && picked[0].id === "3-spades";
       state.hands[id] = hand.filter((item) => !ids.includes(item.id));
@@ -273,17 +280,17 @@ async function act(db, body) {
       state.lastPlayer = id;
       state.passes = 0;
       if (rules.revolution && picked.length === 4) state.revolution = !state.revolution;
-      if (rules.elevenBack && picked.some((item) => item.rank === "J")) state.back = !state.back;
+      if (rules.elevenBack && playRank === "J") state.back = !state.back;
       if (rules.qBomber && bombRanks.length) {
         for (const player of state.players) state.hands[player.id] = (state.hands[player.id] || []).filter((item) => !bombRanks.includes(item.rank));
       }
       finishEmptyHands(state, id);
-      const has8 = rules.eightCut && picked.some((item) => item.rank === "8");
-      const has9 = rules.nineCut && picked.some((item) => item.rank === "9");
-      const has66 = rules.rokurokubi && picked.length === 2 && picked.every((item) => item.rank === "6");
-      const has99 = rules.ambulance && picked.length === 2 && picked.every((item) => item.rank === "9");
+      const has8 = rules.eightCut && playRank === "8";
+      const has9 = rules.nineCut && playRank === "9";
+      const has66 = rules.rokurokubi && picked.length === 2 && playRank === "6";
+      const has99 = rules.ambulance && picked.length === 2 && playRank === "9";
       if (state.phase !== "finished" && rules.fourStop && has8) {
-        state.pendingEightCut = { playerId: id, fourCount: picked.filter((item) => item.rank === "8").length * 2 };
+        state.pendingEightCut = { playerId: id, fourCount: picked.length * 2 };
         state.turn = nextActive(state, state.players.findIndex((p) => p.id === id));
       } else if (state.phase !== "finished" && (has8 || has9 || has66 || has99 || spade3Return)) {
         clearTrick(state, id);
