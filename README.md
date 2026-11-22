@@ -2,9 +2,11 @@
 
 部屋コードで3〜5人が集まって遊べる、スマートフォン対応のオンライン大富豪です。ゲームの状態はD1に保存され、参加者の画面は約1.5秒ごとに同期します。手札は自分の画面にだけ返す設計です。
 
-## 公開サイト
+## 公開方法
 
-https://daifugo-friends-2026.adoreddisc16.chatgpt.site/
+- 画面は GitHub Pages が `public/` から配信します。`.github/workflows/deploy-pages.yml` が `main` への push を公開します。
+- 対戦APIと部屋データは、共有状態を保管するため、D1付きWorkerで動かします。
+- GitHubリポジトリの Settings → Pages で Source を GitHub Actions に設定してください。
 
 ## 遊び方
 
@@ -27,7 +29,7 @@ https://daifugo-friends-2026.adoreddisc16.chatgpt.site/
 - 対戦部屋用テーブルは、最初のAPIアクセス時にD1へ作成されます。
 - `.openai/hosting.json`: SitesプロジェクトとD1バインディング
 
-Workersを実行できるホスティング先を使います。GitHub Pagesだけでは部屋状態を共有できないため、GitHubはソース管理と公開、対戦APIはD1付きのWorkerホスティングを使います。
+GitHub Pagesは画面を配信し、対戦APIはD1付きWorkerで動かします。GitHub Pages自体では部屋状態を共有するサーバー処理を実行できません。
 
 ## ビルド
 
