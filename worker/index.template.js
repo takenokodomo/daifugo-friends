@@ -6,6 +6,7 @@ const RANKS = ["3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2"]
 const RANK_VALUE = Object.fromEntries([...RANKS, "JOKER"].map((rank, index) => [rank, index]));
 const SUIT_VALUE = Object.fromEntries(SUITS.map((suit, index) => [suit, index]));
 const MAX_AGE = 24 * 60 * 60 * 1000;
+const MAX_PLAYERS = 12;
 const DEFAULT_RULES = { spade3: false, revolution: true, eightCut: true, nineCut: false, tenDiscard: false, elevenBack: false, qBomber: false, fourStop: false, rokurokubi: false, ambulance: false };
 
 function json(data, status = 200) {
@@ -15,12 +16,15 @@ function json(data, status = 200) {
   });
 }
 
-function card(rank, suit) {
-  return { id: `${rank}-${suit}`, rank, suit };
+function card(rank, suit, deckIndex = 0) {
+  return { id: `${rank}-${suit}${deckIndex ? `-${deckIndex + 1}` : ""}`, rank, suit };
 }
 
-function shuffledDeck() {
-  const deck = [...SUITS.flatMap((suit) => RANKS.map((rank) => card(rank, suit))), { id: "joker", rank: "JOKER", suit: "joker" }];
+function shuffledDeck(deckCount = 1) {
+  const deck = Array.from({ length: deckCount }, (_, deckIndex) => [
+    ...SUITS.flatMap((suit) => RANKS.map((rank) => card(rank, suit, deckIndex))),
+    { id: deckIndex ? `joker-${deckIndex + 1}` : "joker", rank: "JOKER", suit: "joker" },
+  ]).flat();
   for (let i = deck.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [deck[i], deck[j]] = [deck[j], deck[i]];
@@ -44,22 +48,26 @@ function nextActive(state, from, includeFrom = false) {
 function newState(host, name) {
   return {
     phase: "lobby", hostId: host, players: [{ id: host, name }], hands: {},
-    turn: 0, table: null, passes: 0, lastPlayer: null, revolution: false, back: false,
+    turn: 0, table: null, passes: 0, lastPlayer: null, revolution: false, back: false, openingMove: false,
     pendingEightCut: null, passedPlayers: [], events: [], rules: { ...DEFAULT_RULES },
-    finishOrder: [], createdAt: Date.now(),
+    finishOrder: [], deckCount: 1, createdAt: Date.now(),
   };
 }
 
-function publicState(state, viewerId) {
+function publicState(state, viewerId, spectatorMode = false) {
   const current = state.players[state.turn];
   return {
     phase: state.phase,
+    spectatorMode,
+    deckCount: state.deckCount || 1,
+    openingMove: !!state.openingMove,
     isHost: state.hostId === viewerId,
     players: state.players.map((player) => ({
       name: player.name, cards: (state.hands[player.id] || []).length,
       isHost: player.id === state.hostId, isYou: player.id === viewerId,
       isTurn: current?.id === player.id,
       hasPassed: (state.passedPlayers || []).includes(player.id),
+      hand: spectatorMode ? (state.hands[player.id] || []) : undefined,
       place: state.finishOrder.indexOf(player.id) + 1 || null,
     })),
     hand: state.hands[viewerId] || [],
@@ -135,7 +143,7 @@ async function joinRoom(db, body) {
     const state = JSON.parse(row.state);
     if (state.players.some((p) => p.id === id)) return json({ code, playerId: id });
     if (state.phase !== "lobby") return json({ error: "このゲームはすでに始まっています。" }, 409);
-    if (state.players.length >= 5) return json({ error: "この部屋は満員です（最大5人）。" }, 409);
+    if (state.players.length >= MAX_PLAYERS) return json({ error: `この部屋は満員です（最大${MAX_PLAYERS}人）。` }, 409);
     state.players.push({ id, name });
     if (await saveRoom(db, code, row, state)) return json({ code, playerId: id });
   }
@@ -209,6 +217,7 @@ async function updateRules(db, body) {
     if (state.hostId !== id) return json({ error: "ルールを変更できるのは部屋主だけです。" }, 403);
     if (state.phase !== "lobby") return json({ error: "ゲーム開始後はルールを変更できません。" }, 409);
     state.rules = Object.fromEntries(Object.keys(DEFAULT_RULES).map((key) => [key, key in requested ? requested[key] === true : (state.rules || DEFAULT_RULES)[key] === true]));
+    if (body.deckCount !== undefined) state.deckCount = Number(body.deckCount) === 2 ? 2 : 1;
     if (await saveRoom(db, code, row, state)) return json({ ok: true });
   }
   return json({ error: "ルール変更が重なりました。もう一度お試しください。" }, 409);
@@ -224,7 +233,8 @@ async function startGame(db, body) {
     if (state.hostId !== id) return json({ error: "ゲームを始められるのは部屋主だけです。" }, 403);
     if (state.phase !== "lobby") return json({ error: "ゲームはすでに始まっています。" }, 409);
     if (state.players.length < 3) return json({ error: "ゲーム開始には3人以上必要です。" }, 400);
-    const deck = shuffledDeck();
+    state.deckCount = Number(body.deckCount ?? state.deckCount) === 2 ? 2 : 1;
+    const deck = shuffledDeck(state.deckCount);
     const requested = body.rules && typeof body.rules === "object" ? body.rules : (state.rules || DEFAULT_RULES);
     state.rules = Object.fromEntries(Object.keys(DEFAULT_RULES).map((key) => [key, key in requested ? requested[key] === true : DEFAULT_RULES[key]]));
     const hands = Object.fromEntries(state.players.map((p) => [p.id, []]));
@@ -232,11 +242,39 @@ async function startGame(db, body) {
     Object.values(hands).forEach((hand) => hand.sort(cardOrder));
     state.hands = hands;
     state.passedPlayers = [];
-    state.turn = state.players.findIndex((p) => hands[p.id].some((item) => item.id === "3-clubs"));
+    state.openingMove = true;
+    state.turn = state.players.findIndex((p) => hands[p.id].some((item) => item.rank === "3" && item.suit === "clubs"));
     state.phase = "playing";
     if (await saveRoom(db, code, row, state)) return json({ ok: true });
   }
   return json({ error: "開始操作が重なりました。もう一度お試しください。" }, 409);
+}
+
+async function rematch(db, body) {
+  const code = String(body.code || "").trim().toUpperCase();
+  const id = String(body.playerId || "");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await getRoom(db, code);
+    if (!row) return json({ error: "部屋が見つかりません。" }, 404);
+    const state = JSON.parse(row.state);
+    if (state.hostId !== id) return json({ error: "次のゲームを準備できるのは部屋主だけです。" }, 403);
+    if (state.phase !== "finished") return json({ error: "ゲーム終了後に次のゲームを準備できます。" }, 409);
+    state.phase = "lobby";
+    state.hands = Object.fromEntries(state.players.map((player) => [player.id, []]));
+    state.turn = 0;
+    state.table = null;
+    state.passes = 0;
+    state.lastPlayer = null;
+    state.revolution = false;
+    state.back = false;
+    state.pendingEightCut = null;
+    state.passedPlayers = [];
+    state.finishOrder = [];
+    state.events = [];
+    state.openingMove = true;
+    if (await saveRoom(db, code, row, state)) return json({ ok: true });
+  }
+  return json({ error: "準備画面への移動が重なりました。再読み込みしてください。" }, 409);
 }
 
 function effectiveRank(cards) {
@@ -255,9 +293,9 @@ function beats(cards, table, reversed, rules) {
   if (!table) return true;
   if (cards.length !== table.cards.length) return false;
   const topJoker = table.cards.length === 1 && table.cards[0].rank === "JOKER";
-  const pickedSpade3 = cards.length === 1 && cards[0].id === "3-spades";
+  const pickedSpade3 = cards.length === 1 && cards[0].rank === "3" && cards[0].suit === "spades";
   if (topJoker) return rules.spade3 && pickedSpade3;
-  if (pickedSpade3 && table.cards.length === 1 && table.cards[0].id === "3-spades") return false;
+  if (pickedSpade3 && table.cards.length === 1 && table.cards[0].rank === "3" && table.cards[0].suit === "spades") return false;
   const strength = (group) => RANK_VALUE[effectiveRank(group)] * 4 + Math.max(0, ...group.filter((item) => item.rank !== "JOKER").map((item) => SUIT_VALUE[item.suit] ?? 0));
   const candidate = strength(cards), previous = strength(table.cards);
   return reversed ? candidate < previous : candidate > previous;
@@ -339,22 +377,23 @@ async function act(db, body) {
       if (picked.some((item) => !item) || !beats(picked, state.table, state.revolution !== state.back, rules)) return json({ error: "そのカードでは出せません。枚数と強さを確認してください。" }, 400);
       const playRank = effectiveRank(picked);
       if (state.pendingEightCut) return json({ error: "8切りへの対応を選んでください。" }, 400);
-      if (!state.table && hand.some((item) => item.id === "3-clubs") && !picked.some((item) => item.id === "3-clubs")) return json({ error: "最初の一手には♣3を含めてください。" }, 400);
+      if (state.openingMove && hand.some((item) => item.rank === "3" && item.suit === "clubs") && !picked.some((item) => item.rank === "3" && item.suit === "clubs")) return json({ error: "最初の一手には♣3を含めてください。" }, 400);
       if (state.table?.cards.length === 1 && state.table.cards[0].rank === "8" && rules.fourStop) return json({ error: "8切りは4止めかパスで対応してください。" }, 400);
       if (state.table?.cards.length === 1 && state.table.cards[0].rank === "8" && rules.eightCut) return json({ error: "8切りは4止めかパスで対応してください。" }, 400);
       if (playRank === "8" && !rules.eightCut) return json({ error: "8切りはこの部屋で無効です。" }, 400);
       if (playRank === "9" && rules.nineCut) {
         // 9切り is an optional immediate trick clear.
       }
-      if (state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && rules.spade3 && !(picked.length === 1 && picked[0].id === "3-spades")) return json({ error: "ジョーカーには♠3で返してください。" }, 400);
+      if (state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && rules.spade3 && !(picked.length === 1 && picked[0].rank === "3" && picked[0].suit === "spades")) return json({ error: "ジョーカーには♠3で返してください。" }, 400);
       const discardIds = Array.isArray(body.discard) ? [...new Set(body.discard.map(String))] : [];
       const tenLimit = rules.tenDiscard && playRank === "10" ? picked.length : 0;
       if (discardIds.length > tenLimit || discardIds.some((discardId) => !hand.some((item) => item.id === discardId) || ids.includes(discardId))) return json({ error: "10捨ての枚数を確認してください。" }, 400);
       const bombRanks = Array.isArray(body.bombRanks) ? [...new Set(body.bombRanks.map(String))] : [];
       const bombLimit = rules.qBomber && playRank === "Q" ? picked.length : 0;
       if (bombRanks.length > bombLimit || bombRanks.some((rank) => !RANKS.includes(rank) && rank !== "JOKER")) return json({ error: "Qボンバーの指定を確認してください。" }, 400);
-      const spade3Return = rules.spade3 && state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && picked.length === 1 && picked[0].id === "3-spades";
+      const spade3Return = rules.spade3 && state.table?.cards.length === 1 && state.table.cards[0].rank === "JOKER" && picked.length === 1 && picked[0].rank === "3" && picked[0].suit === "spades";
       state.hands[id] = hand.filter((item) => !ids.includes(item.id));
+      state.openingMove = false;
       state.hands[id] = state.hands[id].filter((item) => !discardIds.includes(item.id));
       state.table = { cards: picked, playerId: id };
       state.lastPlayer = id;
@@ -419,6 +458,7 @@ async function route(request, env) {
     if (request.method === "POST" && url.pathname === "/api/leave") return await leaveRoom(env.DB, await request.json());
     if (request.method === "POST" && url.pathname === "/api/rules") return await updateRules(env.DB, await request.json());
     if (request.method === "POST" && url.pathname === "/api/start") return await startGame(env.DB, await request.json());
+    if (request.method === "POST" && url.pathname === "/api/rematch") return await rematch(env.DB, await request.json());
     if (request.method === "POST" && url.pathname === "/api/action") return await act(env.DB, await request.json());
     if (request.method === "GET" && url.pathname === "/api/room") {
       const code = String(url.searchParams.get("code") || "").toUpperCase();
@@ -427,7 +467,8 @@ async function route(request, env) {
       if (!row || Date.now() - row.updated_at > MAX_AGE) return json({ error: "部屋が見つかりません。" }, 404);
       const state = JSON.parse(row.state);
       if (!state.players.some((p) => p.id === playerId)) return json({ error: "この部屋の参加者ではありません。" }, 403);
-      return json(publicState(state, playerId));
+      const spectatorMode = url.searchParams.get("spectate") === "1" && state.phase !== "lobby";
+      return json(publicState(state, playerId, spectatorMode));
     }
     return json({ error: "Not found" }, 404);
   } catch (error) {
@@ -470,3 +511,4 @@ export default {
     catch { return withCors(json({ error: "サーバーでエラーが発生しました。" }, 500), origin); }
   },
 };
+
