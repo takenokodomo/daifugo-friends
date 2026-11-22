@@ -86,6 +86,16 @@ function setState({ hands, rules }) {
 
 const a = players[0].id, b = players[1].id, c = players[2].id;
 setState({
+  hands: { [a]: [card("A", "clubs")], [b]: [card("A", "spades")], [c]: [card("K", "hearts")] },
+  rules: { eightCut: true },
+});
+const tieRow = db.rooms.get(code), tieState = JSON.parse(tieRow.state);
+tieState.table = { cards: [card("A", "clubs")], playerId: a };
+tieState.turn = 1; tieState.lastPlayer = a; tieState.openingMove = false;
+db.rooms.set(code, { ...tieRow, state: JSON.stringify(tieState) });
+assert.equal((await call("/api/action", { code, playerId: b, action: "play", cards: ["A-spades"] })).status, 400, "同じAはマークが違っても上に出せない");
+
+setState({
   hands: { [a]: [card("8", "clubs"), card("6", "diamonds")], [b]: [card("4", "clubs"), card("5", "clubs")], [c]: [card("7", "diamonds")] },
   rules: { eightCut: true },
 });
@@ -162,6 +172,15 @@ for (let index = 1; index < 12; index++) {
 assert.equal((await call("/api/join", { code: largeCode, playerId: "large-13", name: "TooMany" })).status, 409, "13人目は参加できない");
 assert.equal((await call("/api/rules", { code: largeCode, playerId: largePlayers[0].id, deckCount: 2 })).status, 200);
 assert.equal((await call("/api/start", { code: largeCode, playerId: largePlayers[0].id, deckCount: 2 })).status, 200);
+const lateSpectator = await call("/api/join", { code: largeCode, playerId: "late-observer", name: "Observer" });
+assert.equal(lateSpectator.status, 200, "ゲーム開始後も招待リンクから観戦参加できる");
+assert.equal(lateSpectator.data.spectator, true);
+assert.equal(JSON.parse(db.rooms.get(largeCode).state).players.length, 12, "観戦者は手番のある参加者に数えない");
+const spectatorJoinView = await call(`/api/room?code=${largeCode}&playerId=late-observer`);
+assert.equal(spectatorJoinView.data.isSpectator, true);
+assert.equal(spectatorJoinView.data.spectatorMode, true);
+assert.equal(spectatorJoinView.data.players.reduce((sum, player) => sum + player.hand.length, 0), 106);
+assert.equal((await call("/api/leave", { code: largeCode, playerId: "late-observer" })).data.removed, true, "観戦者の退出を記録から削除する");
 const privateView = await call(`/api/room?code=${largeCode}&playerId=${largePlayers[0].id}`);
 assert.equal(privateView.data.spectatorMode, false);
 assert.equal(privateView.data.players[1].hand, undefined, "通常画面では他プレイヤーのカードを公開しない");
@@ -217,6 +236,9 @@ const pairTable = { ...openTable, table: { cards: [card("5", "clubs"), card("5",
 selection.setSelected(["6-spades"]);
 assert.equal(selection.canSelectCard(hand[2], pairTable), true, "場がペアなら強い同数字のペアを組める");
 assert.equal(selection.canSelectCard(hand[3], pairTable), false, "ペアを出す場面で別の数字は選べない");
+selection.setSelected([]);
+const aceHand = [card("A", "spades")];
+assert.equal(selection.canSelectCard(aceHand[0], { ...openTable, hand: aceHand, openingMove: false, table: { cards: [card("A", "clubs")] } }), false, "画面上でも同じAを出せない");
 const openingHand = [card("3", "clubs"), card("5", "clubs"), card("5", "hearts")];
 selection.setSelected([]);
 assert.equal(selection.canSelectCard(openingHand[0], { ...openTable, hand: openingHand }), true, "最初の一手に♣3を選べる");
